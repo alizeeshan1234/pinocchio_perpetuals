@@ -1,0 +1,11 @@
+prefix=/Users/mohammedzeeshan/Desktop/pinocchio-perp/target/debug/build/openssl-sys-7d7632b33a321c97/out/openssl-build/install
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include 
+
+Name: OpenSSL-libssl
+Description: Secure Sockets Layer and cryptography libraries
+Version: 3.5.2
+Requires.private: libcrypto
+Libs: -L${libdir} -lssl
+Cflags: -I${includedir}

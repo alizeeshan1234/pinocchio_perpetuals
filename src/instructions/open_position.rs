@@ -1,12 +1,14 @@
 use pinocchio::{account_info::AccountInfo, instruction::Signer, program_error::ProgramError, pubkey::Pubkey, sysvars::{clock::Clock, rent::Rent, Sysvar}, *};
 use pinocchio_system::instructions::CreateAccount;
 use pinocchio_token::instructions::TransferChecked;
+use pinocchio_token::state::TokenAccount;
 
 use crate::{instructions::get_sol_price_for_trading, states::{Market, UserAccount, Position}};
 
 pub fn process_open_position(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
 
-    let [user,  // The trader (must sign transaction)
+    let [
+        user,  // The trader (must sign transaction)
         market_authority, // Authority that controls the market
         collateral_mint, // Token mint for collateral (e.g., USDC)
         user_mint, // User's token mint (must match collateral mint)
@@ -23,106 +25,97 @@ pub fn process_open_position(accounts: &[AccountInfo], instruction_data: &[u8]) 
         return Err(ProgramError::InvalidAccountData);
     };
 
-    // Validate signers and programs
+    // ---- Basic checks ----
     if !user.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
-
-    // Validate system program
     if *system_program.key() != pinocchio_system::ID {
         return Err(ProgramError::InvalidAccountData);
     }
-
-    // Validate token program
     if *token_program.key() != pinocchio_token::ID {
         return Err(ProgramError::InvalidAccountData);
     }
-
     if instruction_data.len() < 25 {
         return Err(ProgramError::InvalidInstructionData);
     }
-
     if user_mint.key() != collateral_mint.key() {
         return Err(ProgramError::InvalidAccountData);
     }
 
+    // ---- Parse instruction ----
     let market_id = instruction_data[0];
-
     let size = i128::from_le_bytes(
         instruction_data[1..17].try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?
     );
-
-    //Collateral Amount
     let margin_amount = u64::from_le_bytes(
         instruction_data[17..25].try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?
     );
-
     if size == 0 {
         return Err(ProgramError::InvalidInstructionData);
-    }
+    };
 
-    if margin_amount == 0 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
-    // Validate market account PDA
+    // ---- Derive & check PDAs ----
     let (market_account_pda, _market_bump) = pubkey::find_program_address(
         &[b"market_account", market_authority.key().as_ref(), market_id.to_le_bytes().as_ref()],
         &crate::ID
     );
-
     if *market_account.key() != market_account_pda {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Validate user account PDA
     let (user_account_pda, user_bump) = pubkey::find_program_address(
         &[b"user_account", user.key().as_ref()],
         &crate::ID
     );
-
     if *user_account.key() != user_account_pda {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Validate user position account PDA
     let (user_position_account_pda, position_bump) = pubkey::find_program_address(
         &[b"position", user.key().as_ref(), market_id.to_le_bytes().as_ref()],
         &crate::ID
     );
-
     if *user_position_account.key() != user_position_account_pda {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Load and validate market
-    let mut market = Market::from_account_info_mut(market_account)?;
-
-    if !market.is_initialized {
-        return Err(ProgramError::UninitializedAccount);
-    }
-
-    // Validate collateral vault PDA
     let (collateral_vault_pda, _collateral_bump) = pubkey::find_program_address(
         &[b"collateral_vault", collateral_mint.key().as_ref(), market_id.to_le_bytes().as_ref()],
         &crate::ID
     );
-
     if *collateral_vault.key() != collateral_vault_pda {
         return Err(ProgramError::InvalidSeeds);
     }
 
+    // ---- Load market ----
+    let mut market = Market::from_account_info_mut(market_account)?;
+    if !market.is_initialized {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if market.authority != *market_authority.key() {
+        return Err(ProgramError::InvalidAccountData);
+    }
     if market.collateral_vault != *collateral_vault.key() {
         return Err(ProgramError::InvalidAccountData);
     }
-
     if market.collateral_mint != *collateral_mint.key() {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Get current time and price
+    // ---- Token account validations ----
+    let user_ta = TokenAccount::from_account_info(user_token_account)?;
+    if *user_ta.owner() != *user.key() || *user_ta.mint() != *collateral_mint.key() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let vault_ta = TokenAccount::from_account_info(collateral_vault)?;
+    if *vault_ta.mint() != *collateral_mint.key() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // ---- Sysvars / Oracle ----
     let clock = Clock::from_account_info(clock_sysvar)?;
     let current_time = clock.unix_timestamp;
 
@@ -132,29 +125,27 @@ pub fn process_open_position(accounts: &[AccountInfo], instruction_data: &[u8]) 
         60
     )?;
 
-    // Calculate position value
+    // ---- Notional & margin checks (u128) ----
     let position_value = calculate_position_value(size, current_price)?;
-
-    // Check margin requirements
     let required_margin = calculate_required_margin(position_value, market.initial_margin)?;
 
     if margin_amount < required_margin {
         return Err(ProgramError::InsufficientFunds);
     }
 
-    // Check leverage limits
     let leverage = calculate_leverage(position_value, margin_amount)?;
 
     if leverage > market.max_leverage {
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    //Fee calculation
+    // ---- Fee calculation (u128) ----
     let trading_fee = calculate_trading_fee(position_value, market.fee_rate)?;
     let total_required = margin_amount
         .checked_add(trading_fee)
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
+    // ---- Ensure user account exists ----
     let mut user_account_data = if user_account.data_is_empty() {
         let lamports = Rent::get()?.minimum_balance(UserAccount::SIZE);
 
@@ -187,10 +178,7 @@ pub fn process_open_position(accounts: &[AccountInfo], instruction_data: &[u8]) 
         return Err(ProgramError::InvalidAccountData);
     }
 
-    if user_account_data.margin_balance < total_required {
-        return Err(ProgramError::InsufficientFunds);
-    }
-
+    // ---- Transfer margin from user -> vault ----
     TransferChecked {
         from: user_token_account,
         to: collateral_vault,
@@ -200,6 +188,17 @@ pub fn process_open_position(accounts: &[AccountInfo], instruction_data: &[u8]) 
         decimals: 6, 
     }.invoke()?;
 
+    user_account_data.margin_balance = user_account_data.margin_balance.checked_add(margin_amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    if user_account_data.margin_balance < trading_fee as u64 {
+        return Err(ProgramError::InsufficientFunds);
+    };
+
+    user_account_data.margin_balance = user_account_data.margin_balance.checked_sub(trading_fee as u64)
+        .ok_or(ProgramError::InsufficientFunds)?;
+
+    // ---- Create or update position ----
     let position_data = if user_position_account.data_is_empty() {
         println!("Creating new position account");
 
@@ -249,10 +248,11 @@ pub fn process_open_position(accounts: &[AccountInfo], instruction_data: &[u8]) 
         position
     };
 
-    // Update user account balance (deduct margin and fees)
-    user_account_data.margin_balance = user_account_data.margin_balance
-        .checked_sub(total_required)
-        .ok_or(ProgramError::InsufficientFunds)?;
+    // ---- Update market accounting (new collateral only) ----
+    market.total_collateral = market
+        .total_collateral
+        .checked_add(margin_amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     // Update market open interest
     update_market_open_interest(&mut market, size, margin_amount)?;
